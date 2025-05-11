@@ -1,52 +1,51 @@
-import pl from "npm:nodejs-polars";
-import Graph from "npm:graphology";
-import pagerank from "npm:graphology-pagerank";
+/**
+ * Run the following command to compute the page rank of the graph:
+ * deno run --allow-read src/Graph/Controllers.ts compute
+ */
 
-type PROptions = {
-  damping?: number;
-  maxIterations?: number;
-  tolerance?: number;
-};
+import * as pl from "npm:nodejs-polars@0.18.0";
 
-const defaultPRParams = {
-  damping: 0.85,
-  maxIterations: 100,
-  tolerance: 1e-6,
-};
+import { computePageRank } from "./Model.ts"
 
+const USER_FOLLOW_LIMIT = 100;
 
-export async function computePageRank(dfClean, opts: PROptions = {}) {
+async function generatePageRankFile(lazyData: pl.LazyFrame): Promise<pl.DataFrame> {
+  const degrees = lazyData.groupBy("target_fid")
+    .agg(pl.count("target_fid").alias("in_deg"))
+    .filter(pl.col("in_deg").gtEq(USER_FOLLOW_LIMIT));
 
-  const { damping, maxIterations, tolerance } = {
-    ...defaultPRParams,
-    ...opts,
-  };
+  // Adding filtering to remove users without at least 100 follows
+  const filtered = lazyData.join(degrees, { leftOn: "fid", rightOn: "target_fid", how: "inner" });
 
-  // 3. Extract JS arrays of edges
-  const fids    = dfClean.getColumn("fid").toArray() as number[];
-  const targets = dfClean.getColumn("target_fid").toArray() as number[];
+  const current_network = filtered
+    .groupBy(["fid", "target_fid"])
+    .agg(
+      pl.col("type").sum().alias("type_sum"),
+    )
 
-  // 4. Build a directed graph
-  const graph = new Graph({ type: "directed" });
-  for (let i = 0; i < fids.length; i++) {
-    const u = fids[i].toString();
-    const v = targets[i].toString();
-    if (!graph.hasNode(u)) graph.addNode(u);
-    if (!graph.hasNode(v)) graph.addNode(v);
-    graph.addEdge(u, v);
-  }
+  // Added just in case users follow then unfollow in the data.
+  const cleaned_network = current_network
+    .withColumns([
+      pl
+        .when(pl.col("type_sum").gtEq(1))
+        .then(pl.lit(1))
+        .otherwise(pl.lit(0))
+        .alias("type_sum"),
+    ])
+    .filter(pl.col("type_sum").eq(1));
 
-  // 5. Run PageRank
-  const scores = pagerank(graph, {
-    damping,      // teleport probability
-    maxIterations, // stop after 100 iterations (tune as needed)
-    tolerance     // convergence threshold
-  });
+  const live = await cleaned_network.collect();
 
-  // 6. Turn scores back into a Polars DataFrame
-  const nodes = Object.keys(scores);
-  const ranks = Object.values(scores);
-  const prDf = pl.DataFrame({ node: nodes, pageRank: ranks });
+  return await computePageRank(live);
+}
 
-  return prDf;
+if (import.meta.main) {
+  const src_data = "data/follows/farcasterdata-*.csv";
+  const lazyData = pl.scanCSV(src_data, { hasHeader: true });
+  const pr_data = await generatePageRankFile(lazyData);
+
+  // Write the DataFrame to CSV using a writable file handle
+  const file = await Deno.open("data/pr_data.csv", { write: true, create: true, truncate: true });
+  await pr_data.writeCSV(file);
+  file.close();
 }
